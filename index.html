@@ -109,6 +109,7 @@
   function initWorker() {
     if (worker) return;
 
+    // ※ file:// だと Worker が死ぬことが多いです（HTTPS/localhost 推奨）
     worker = new Worker('./zxing_worker.js');
 
     worker.onmessage = (ev) => {
@@ -137,14 +138,11 @@
   }
 
   function decodeInWorker(imageData, options) {
-    // 1リクエスト=1レスポンスで扱いやすくする
     return new Promise((resolve, reject) => {
       if (!workerReady) return reject(new Error("worker not ready"));
-
       const id = reqId++;
       pending.set(id, { resolve, reject });
 
-      // Transferable でコピーを避ける
       worker.postMessage({
         type: 'req',
         id,
@@ -163,36 +161,22 @@
   let isScanning = false;
   let lastDetectTime = 0;
 
-// ★自動調整SCAN間隔（遅い端末ほど間隔を伸ばす）
-let scanIntervalMs = 120;
+  let scanIntervalMs = 120;
+  let emaDecodeMs = 0;
+  let emaTotalMs  = 0;
+  const EMA_ALPHA = 0.2;
 
-// decode時間の指数移動平均（EMA）
-let emaDecodeMs = 0;      // payload.ms（worker内部）
-let emaTotalMs  = 0;      // total（getImageData + postMessage + decode など全部込み）
-const EMA_ALPHA = 0.2;
+  let firstFailStreak = 0;
+  let secondFailStreak = 0;
+  let decodeLevel = 0;
+  let secondSearchLevel = 0;
 
-// 段階化用の失敗連続カウンタ
-let firstFailStreak = 0;   // 1個目が取れない連続回数
-let secondFailStreak = 0;  // 2個目が取れない連続回数
-
-// decodeオプションの段階（0=軽い, 1=中, 2=重い）
-let decodeLevel = 0;
-
-// 2個目探索の段階（0=速い/狭い, 1=標準, 2=救済）
-let secondSearchLevel = 0;
-
-function clampInt(v, a, b) { return Math.max(a, Math.min(b, v | 0)); }
-
-// ★重いときだけスキャン間隔を伸ばす（目標：処理が詰まらない）
-function updateScanInterval() {
-  // totalが大きいほど次フレームを間引く
-  const base = emaTotalMs || 0;
-  // だいたい「処理時間の1.2倍 + 10ms」を目安にする
-  const target = Math.round(base * 1.2 + 10);
-
-  // 軽い時は下げすぎない、重い時は上げる
-  scanIntervalMs = clampInt(target, 90, 320);
-}
+  function clampInt(v, a, b) { return Math.max(a, Math.min(b, v | 0)); }
+  function updateScanInterval() {
+    const base = emaTotalMs || 0;
+    const target = Math.round(base * 1.2 + 10);
+    scanIntervalMs = clampInt(target, 90, 320);
+  }
 
   let firstQR = null;
   let secondQR = null;
@@ -202,6 +186,10 @@ function updateScanInterval() {
   // ==========
   async function startCamera() {
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("このブラウザは getUserMedia に対応していません");
+      }
+
       if (video.srcObject) {
         try { video.srcObject.getTracks().forEach(t => t.stop()); } catch (_) {}
         video.srcObject = null;
@@ -224,11 +212,18 @@ function updateScanInterval() {
       video.srcObject = stream;
 
       await new Promise((resolve) => {
-        const to = setTimeout(resolve, 1000);
+        const to = setTimeout(resolve, 1500);
         video.onloadedmetadata = () => { clearTimeout(to); resolve(); };
       });
 
       await video.play();
+
+      // ★ここでキャンバス初期サイズを確定
+      if (video.videoWidth && video.videoHeight) {
+        overlayCanvas.width = video.videoWidth;
+        overlayCanvas.height = video.videoHeight;
+      }
+
       return true;
     } catch (err) {
       console.error(err);
@@ -238,7 +233,7 @@ function updateScanInterval() {
   }
 
   // ==========
-  // QR Twin logic (same structure as original)
+  // QR Twin logic
   // ==========
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
@@ -267,149 +262,87 @@ function updateScanInterval() {
     };
   }
 
-function mapWorkerResultToItem(best, sx = 0, sy = 0, sw = 0, sh = 0, scale = 1) {
-  let pts = [];
-  if (best && best.position) {
-    const pos = best.position;
-    const cand = [pos.topLeft, pos.topRight, pos.bottomRight, pos.bottomLeft].filter(Boolean);
-    pts = cand.map(p => ({
-      x: (p.x / scale) + sx,
-      y: (p.y / scale) + sy
-    }));
+  function mapWorkerResultToItem(best, sx = 0, sy = 0, sw = 0, sh = 0, scale = 1) {
+    let pts = [];
+    if (best && best.position) {
+      const pos = best.position;
+      const cand = [pos.topLeft, pos.topRight, pos.bottomRight, pos.bottomLeft].filter(Boolean);
+      pts = cand.map(p => ({
+        x: (p.x / scale) + sx,
+        y: (p.y / scale) + sy
+      }));
+    }
+
+    let center = getCenter(pts);
+    let bb = bboxFromPoints(pts);
+
+    if (!bb) {
+      bb = { x: sx, y: sy, w: sw, h: sh };
+      center = { x: sx + sw / 2, y: sy + sh / 2 };
+    }
+
+    let size = Math.max(bb.w, bb.h);
+    size = Math.max(120, size);
+
+    return {
+      text: best?.text || "",
+      points: pts,
+      center,
+      bbox: bb,
+      size,
+      meta: best || null
+    };
   }
 
-  // ★フォールバック：positionが無い時は「ROI中心」を起点にする
-  let center = getCenter(pts);
-  let bb = bboxFromPoints(pts);
-
-  if (!bb) {
-    // ROIを仮bboxとして扱う（描画＆探索起点が壊れない）
-    bb = { x: sx, y: sy, w: sw, h: sh };
-    center = { x: sx + sw / 2, y: sy + sh / 2 };
+  function getDecodeOpts(level) {
+    if (level === 0) return { formats: ["QRCode"], tryHarder: false, tryRotate: false, tryInvert: false };
+    if (level === 1) return { formats: ["QRCode"], tryHarder: false, tryRotate: true,  tryInvert: false };
+    return               { formats: ["QRCode"], tryHarder: true,  tryRotate: true,  tryInvert: true  };
   }
 
-  let size = Math.max(bb.w, bb.h);
-  size = Math.max(120, size); // ★2個目探索に効くので下限を少し上げる
+  async function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale = 1.0) {
+    sx = clamp(sx, 0, frameW - 2);
+    sy = clamp(sy, 0, frameH - 2);
+    sw = clamp(sw, 2, frameW - sx);
+    sh = clamp(sh, 2, frameH - sy);
 
-  return {
-    text: best?.text || "",
-    points: pts,
-    center,
-    bbox: bb,
-    size,
-    meta: best || null
-  };
-}
+    const tw = Math.max(64, Math.floor(sw * scale));
+    const th = Math.max(64, Math.floor(sh * scale));
 
-async function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale = 1.0) {
-  sx = clamp(sx, 0, frameW - 2);
-  sy = clamp(sy, 0, frameH - 2);
-  sw = clamp(sw, 2, frameW - sx);
-  sh = clamp(sh, 2, frameH - sy);
+    workCanvas.width = tw;
+    workCanvas.height = th;
+    workCtx.clearRect(0, 0, tw, th);
+    workCtx.drawImage(frameCanvas, sx, sy, sw, sh, 0, 0, tw, th);
 
-  const tw = Math.max(64, Math.floor(sw * scale));
-  const th = Math.max(64, Math.floor(sh * scale));
+    const img = workCtx.getImageData(0, 0, tw, th);
+    const opts = getDecodeOpts(decodeLevel);
 
-  workCanvas.width = tw;
-  workCanvas.height = th;
-  workCtx.clearRect(0, 0, tw, th);
-  workCtx.drawImage(frameCanvas, sx, sy, sw, sh, 0, 0, tw, th);
+    const t0 = performance.now();
+    let payload;
+    try {
+      payload = await decodeInWorker(img, opts);
+    } catch (e) {
+      document.getElementById('perfMsg').innerText = `decode(worker) ERROR: ${e?.message || e}`;
+      return null;
+    }
+    const t1 = performance.now();
 
-  const img = workCtx.getImageData(0, 0, tw, th);
+    const wms = Number(payload.ms || 0);
+    const tms = (t1 - t0);
 
-  // Worker decode options（段階化）
-  const opts = getDecodeOpts(decodeLevel);
+    emaDecodeMs = emaDecodeMs ? (emaDecodeMs * (1 - EMA_ALPHA) + wms * EMA_ALPHA) : wms;
+    emaTotalMs  = emaTotalMs  ? (emaTotalMs  * (1 - EMA_ALPHA) + tms * EMA_ALPHA) : tms;
 
-  const t0 = performance.now();
-
-  let payload;
-  try {
-    payload = await decodeInWorker(img, opts);
-  } catch (e) {
+    updateScanInterval();
     document.getElementById('perfMsg').innerText =
-      `decode(worker) ERROR: ${e?.message || e}`;
-    return null;
+      `decodeL=${decodeLevel} scan=${scanIntervalMs}ms | worker=${wms.toFixed(1)}ms ema=${emaDecodeMs.toFixed(1)} | total=${tms.toFixed(1)}ms ema=${emaTotalMs.toFixed(1)}`;
+
+    if (!payload.found) return null;
+
+    const best = payload.results[0];
+    return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
   }
 
-  const t1 = performance.now();
-
-  // EMA更新（worker内部ms / total）
-  const wms = Number(payload.ms || 0);
-  const tms = (t1 - t0);
-
-  emaDecodeMs = emaDecodeMs ? (emaDecodeMs * (1 - EMA_ALPHA) + wms * EMA_ALPHA) : wms;
-  emaTotalMs  = emaTotalMs  ? (emaTotalMs  * (1 - EMA_ALPHA) + tms * EMA_ALPHA) : tms;
-
-  updateScanInterval();
-
-  document.getElementById('perfMsg').innerText =
-    `decodeL=${decodeLevel} scan=${scanIntervalMs}ms | worker=${wms.toFixed(1)}ms ema=${emaDecodeMs.toFixed(1)} | total=${tms.toFixed(1)}ms ema=${emaTotalMs.toFixed(1)}`;
-
-  if (!payload.found) return null;
-
-  const best = payload.results[0];
-  return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
-}
-
-function getDecodeOpts(level) {
-  // level 0: 最速（回転/反転/tryHarderなし）
-  // level 1: 中（回転だけ許可）
-  // level 2: 重（tryHarder + 回転 + 反転）
-  if (level === 0) return { formats: ["QRCode"], tryHarder: false, tryRotate: false, tryInvert: false };
-  if (level === 1) return { formats: ["QRCode"], tryHarder: false, tryRotate: true,  tryInvert: false };
-  return               { formats: ["QRCode"], tryHarder: true,  tryRotate: true,  tryInvert: true  };
-}
-
-// Worker decode options（段階化）
-const opts = getDecodeOpts(decodeLevel);
-
-const t0 = performance.now();
-
-let payload;
-try {
-  payload = await decodeInWorker(img, opts);
-} catch (e) {
-  document.getElementById('perfMsg').innerText =
-    `decode(worker) ERROR: ${e?.message || e}`;
-  return null;
-}
-
-const t1 = performance.now();
-
-let payload;
-try {
-  payload = await decodeInWorker(img, opts);
-} catch (e) {
-  // ★ ここが追加ポイント：Workerエラーを画面表示
-  document.getElementById('perfMsg').innerText =
-    `decode(worker) ERROR: ${e?.message || e}`;
-  return null;
-}
-
-const t1 = performance.now();
-
-// payload: { found:boolean, results:[.] , ms:number }
-// EMA更新（worker内部ms / total）
-const wms = Number(payload.ms || 0);
-const tms = (t1 - t0);
-
-emaDecodeMs = emaDecodeMs ? (emaDecodeMs * (1 - EMA_ALPHA) + wms * EMA_ALPHA) : wms;
-emaTotalMs  = emaTotalMs  ? (emaTotalMs  * (1 - EMA_ALPHA) + tms * EMA_ALPHA) : tms;
-
-updateScanInterval();
-
-document.getElementById('perfMsg').innerText =
-  `decodeL=${decodeLevel} scan=${scanIntervalMs}ms | worker=${wms.toFixed(1)}ms ema=${emaDecodeMs.toFixed(1)} | total=${tms.toFixed(1)}ms ema=${emaTotalMs.toFixed(1)}`;
-
-if (!payload.found) return null;
-
-const best = payload.results[0];
-return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
-  }
-
-  // ★ここが「QRツインでも単体を的確に読む」ための改良核心（元ロジック維持）
-  // 1) フルフレーム複数スケール
-  // 2) ダメなら少数タイル探索（中心＋周辺）
   async function findFirstRobust(W, H) {
     const fullScales = [1.0, 0.86, 1.18];
     for (const sc of fullScales) {
@@ -425,15 +358,15 @@ return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
       const th = Math.floor(H * tr);
 
       const positions = [
-        { x: (W - tw) / 2, y: (H - th) / 2 }, // center
-        { x: 0, y: 0 },                       // TL
-        { x: W - tw, y: 0 },                  // TR
-        { x: 0, y: H - th },                  // BL
-        { x: W - tw, y: H - th },             // BR
-        { x: (W - tw) / 2, y: 0 },            // top
-        { x: (W - tw) / 2, y: H - th },       // bottom
-        { x: 0, y: (H - th) / 2 },            // left
-        { x: W - tw, y: (H - th) / 2 },       // right
+        { x: (W - tw) / 2, y: (H - th) / 2 },
+        { x: 0, y: 0 },
+        { x: W - tw, y: 0 },
+        { x: 0, y: H - th },
+        { x: W - tw, y: H - th },
+        { x: (W - tw) / 2, y: 0 },
+        { x: (W - tw) / 2, y: H - th },
+        { x: 0, y: (H - th) / 2 },
+        { x: W - tw, y: (H - th) / 2 },
       ];
 
       for (const pos of positions) {
@@ -447,73 +380,63 @@ return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
     return null;
   }
 
- async function findSecondByDistance(first, W, H) {
-  if (!first || !first.center) return null;
+  async function findSecondByDistance(first, W, H) {
+    if (!first || !first.center) return null;
 
-  const cx = first.center.x;
-  const cy = first.center.y;
+    const cx = first.center.x;
+    const cy = first.center.y;
+    const base = Math.max(first.size || 0, 180);
+    const level = secondSearchLevel;
 
-  // ★sizeが小さく出ると探索半径が届かないので下限を上げる
-  const base = Math.max(first.size || 0, 180);
+    let radiiKs, N, roiSizes, scales;
 
-  // secondSearchLevel:
-  // 0=速い（試行少なめ）
-  // 1=標準（少し広め）
-  // 2=救済（かなり広め・重め）
-  const level = secondSearchLevel;
+    if (level === 0) {
+      radiiKs = [1.0, 1.5];
+      N = 8;
+      roiSizes = [clamp(base * 1.35, 160, 560)];
+      scales = [1.0, 1.18];
+    } else if (level === 1) {
+      radiiKs = [0.9, 1.2, 1.55, 1.9];
+      N = 14;
+      roiSizes = [
+        clamp(base * 1.35, 160, 600),
+        clamp(base * 1.70, 220, 720),
+      ];
+      scales = [1.18, 1.0, 0.86];
+    } else {
+      radiiKs = [1.0, 1.5, 2.1, 2.7, 3.2];
+      N = 18;
+      roiSizes = [
+        clamp(base * 1.70, 220, 760),
+        clamp(base * 2.20, 320, 940),
+      ];
+      scales = [1.18, 1.0, 0.86];
+    }
 
-  let radiiKs, N, roiSizes, scales;
+    const angles = [];
+    for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
 
-  if (level === 0) {
-    // 最速：まずは “近め” を少ない試行で探す
-    radiiKs = [1.0, 1.5];
-    N = 8;
-    roiSizes = [clamp(base * 1.35, 160, 560)];
-    scales = [1.0, 1.18]; // 0.86はまず外す（遅くなる）
-  } else if (level === 1) {
-    // 標準：範囲を広げる
-    radiiKs = [0.9, 1.2, 1.55, 1.9];
-    N = 14;
-    roiSizes = [
-      clamp(base * 1.35, 160, 600),
-      clamp(base * 1.70, 220, 720),
-    ];
-    scales = [1.18, 1.0, 0.86];
-  } else {
-    // 救済：遠い/ズレる/歪むケース用
-    radiiKs = [1.0, 1.5, 2.1, 2.7, 3.2];
-    N = 18;
-    roiSizes = [
-      clamp(base * 1.70, 220, 760),
-      clamp(base * 2.20, 320, 940),
-    ];
-    scales = [1.18, 1.0, 0.86];
-  }
+    for (const roiSize of roiSizes) {
+      for (const k of radiiKs) {
+        const r = base * k;
 
-  const angles = [];
-  for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
+        for (const ang of angles) {
+          const tx = cx + Math.cos(ang) * r;
+          const ty = cy + Math.sin(ang) * r;
 
-  for (const roiSize of roiSizes) {
-    for (const k of radiiKs) {
-      const r = base * k;
+          const sx = Math.floor(tx - roiSize / 2);
+          const sy = Math.floor(ty - roiSize / 2);
 
-      for (const ang of angles) {
-        const tx = cx + Math.cos(ang) * r;
-        const ty = cy + Math.sin(ang) * r;
-
-        const sx = Math.floor(tx - roiSize / 2);
-        const sy = Math.floor(ty - roiSize / 2);
-
-        for (const sc of scales) {
-          const item = await decodeRegion(W, H, sx, sy, roiSize, roiSize, sc);
-          if (item && item.text && item.text !== first.text) return item;
+          for (const sc of scales) {
+            const item = await decodeRegion(W, H, sx, sy, roiSize, roiSize, sc);
+            if (item && item.text && item.text !== first.text) return item;
+          }
         }
       }
     }
-  }
 
-  return null;
-}
+    return null;
+  }
 
   // ==========
   // Main scan loop
@@ -526,53 +449,43 @@ return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
     frameCanvas.height = H;
     frameCtx.drawImage(video, 0, 0, W, H);
 
-    // 1) まず1個目（強化単体）
-if (!firstQR) {
-  const got = await findFirstRobust(W, H);
+    if (!firstQR) {
+      const got = await findFirstRobust(W, H);
+      if (got) {
+        firstQR = got;
+        firstFailStreak = 0;
+        decodeLevel = 0;
+        updateUI();
+      } else {
+        firstFailStreak++;
+        if (firstFailStreak < 3) decodeLevel = 0;
+        else if (firstFailStreak < 8) decodeLevel = 1;
+        else decodeLevel = 2;
+      }
+    } else {
+      const got = await decodeRegion(W, H, 0, 0, W, H, 0.92);
+      if (got && got.text === firstQR.text) {
+        firstQR = got;
+        updateUI();
+      }
+    }
 
-  if (got) {
-    firstQR = got;
-    firstFailStreak = 0;
-    decodeLevel = 0;         // 取れたら最速に戻す
-    updateUI();
-  } else {
-    firstFailStreak++;
+    if (firstQR && !secondQR) {
+      if (secondFailStreak < 3) secondSearchLevel = 0;
+      else if (secondFailStreak < 8) secondSearchLevel = 1;
+      else secondSearchLevel = 2;
 
-    // ★段階化：外し続けたら decode を重くする
-    // 0: 最速 → 1: 回転ON → 2: ぜんぶON
-    if (firstFailStreak < 3) decodeLevel = 0;
-    else if (firstFailStreak < 8) decodeLevel = 1;
-    else decodeLevel = 2;
-  }
-} else {
-  // 1個目が見えている間は軽く更新（ここは軽い設定を維持）
-  const got = await decodeRegion(W, H, 0, 0, W, H, 0.92);
-  if (got && got.text === firstQR.text) {
-    firstQR = got;
-    updateUI();
-  }
-}
+      const found = await findSecondByDistance(firstQR, W, H);
+      if (found) {
+        secondQR = found;
+        secondFailStreak = 0;
+        secondSearchLevel = 0;
+        updateUI();
+      } else {
+        secondFailStreak++;
+      }
+    }
 
-    // 2) 1個目が取れたら2個目を距離探索
-// 2) 1個目が取れたら2個目を距離探索（段階化）
-if (firstQR && !secondQR) {
-  // ★2個目が取れない連続回数で探索段階を上げる（緩める）
-  if (secondFailStreak < 3) secondSearchLevel = 0;
-  else if (secondFailStreak < 8) secondSearchLevel = 1;
-  else secondSearchLevel = 2;
-
-  const found = await findSecondByDistance(firstQR, W, H);
-  if (found) {
-    secondQR = found;
-    secondFailStreak = 0;
-    secondSearchLevel = 0;
-    updateUI();
-  } else {
-    secondFailStreak++;
-  }
-}
-
-    // 3) 描画（bbox）
     ctx.clearRect(0, 0, W, H);
     if (firstQR?.bbox) drawBBox(firstQR.bbox, '#00E676');
     if (secondQR?.bbox) drawBBox(secondQR.bbox, '#29B6F6');
@@ -586,18 +499,19 @@ if (firstQR && !secondQR) {
   function scanLoop() {
     if (!isScanning) return;
 
+    // 動的リサイズ（metadata後にサイズが入る）
     if (video.videoWidth && overlayCanvas.width !== video.videoWidth) {
       overlayCanvas.width = video.videoWidth;
       overlayCanvas.height = video.videoHeight;
     }
 
     const now = Date.now();
-if (!isProcessing && now - lastDetectTime > scanIntervalMs && video.readyState >= 2 && workerReady) {
+    if (!isProcessing && (now - lastDetectTime) > scanIntervalMs && video.readyState >= 2 && workerReady) {
       isProcessing = true;
       lastDetectTime = now;
 
       processOneFrame()
-        .catch(() => { /* ignore */ })
+        .catch(() => {})
         .finally(() => { isProcessing = false; });
     }
 
@@ -638,28 +552,27 @@ if (!isProcessing && now - lastDetectTime > scanIntervalMs && video.readyState >
     document.getElementById('finalText2').innerHTML = formatResultText(secondQR.text);
   }
 
-function goBack() {
-  firstQR = null;
-  secondQR = null;
+  function goBack() {
+    firstQR = null;
+    secondQR = null;
 
-  // ★段階化状態をリセット
-  firstFailStreak = 0;
-  secondFailStreak = 0;
-  decodeLevel = 0;
-  secondSearchLevel = 0;
-  emaDecodeMs = 0;
-  emaTotalMs = 0;
-  scanIntervalMs = 120;
+    firstFailStreak = 0;
+    secondFailStreak = 0;
+    decodeLevel = 0;
+    secondSearchLevel = 0;
+    emaDecodeMs = 0;
+    emaTotalMs = 0;
+    scanIntervalMs = 120;
 
-  document.getElementById('text1').innerText = "未検出";
-  document.getElementById('text2').innerText = "未検出";
-  document.getElementById('resultScreen').style.display = 'none';
-  document.getElementById('cameraContainer').style.display = 'block';
-  document.getElementById('statusPanel').style.display = 'block';
-  ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-  isScanning = true;
-  requestAnimationFrame(scanLoop);
-}
+    document.getElementById('text1').innerText = "未検出";
+    document.getElementById('text2').innerText = "未検出";
+    document.getElementById('resultScreen').style.display = 'none';
+    document.getElementById('cameraContainer').style.display = 'block';
+    document.getElementById('statusPanel').style.display = 'block';
+    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    isScanning = true;
+    requestAnimationFrame(scanLoop);
+  }
 
   // ==========
   // Start
@@ -672,10 +585,12 @@ function goBack() {
     try {
       initWorker();
 
-      // Worker ready を軽く待つ（最大 3秒）
+      // Worker ready を待つ（最大 3秒）
       const t0 = Date.now();
       while (!workerReady) {
-        if (Date.now() - t0 > 3000) throw new Error("デコーダー初期化がタイムアウトしました（index.js / wasmの配置を確認）");
+        if (Date.now() - t0 > 3000) {
+          throw new Error("デコーダー初期化がタイムアウトしました（zxing_worker.js / wasm の配置とパスを確認）");
+        }
         await new Promise(r => setTimeout(r, 50));
       }
 
@@ -696,7 +611,6 @@ function goBack() {
     }
   }
 
-  // グローバルに公開（onclickから呼ぶ）
   window.startApp = startApp;
   window.goBack = goBack;
 </script>
