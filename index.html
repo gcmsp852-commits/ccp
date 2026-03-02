@@ -380,6 +380,43 @@
     return null;
   }
 
+// ★追加：距離とサイズ
+function dist2(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return dx*dx + dy*dy;
+}
+function getDistance(a, b) {
+  return Math.sqrt(dist2(a,b));
+}
+
+// points があれば「上辺長」を qrSize として使う（無ければ bbox から推定）
+function estimateQrSize(item) {
+  if (item?.points && item.points.length >= 2) {
+    return getDistance(item.points[0], item.points[1]);
+  }
+  if (item?.bbox) return Math.max(item.bbox.w, item.bbox.h);
+  if (item?.size) return item.size;
+  return 0;
+}
+
+// ★追加：あなたの“別QR判定条件”をそのまま関数化
+function isDifferentSecondCandidate(first, cand, frameW) {
+  if (!first || !cand) return false;
+  if (!first.center || !cand.center) return false;
+
+  // 条件(1) テキストが違う
+  if (cand.text && first.text && cand.text !== first.text) return true;
+
+  // 条件(2) テキストが同じでも距離が離れていれば別QR
+  const d = getDistance(first.center, cand.center);
+  const qrSize = estimateQrSize(cand) || estimateQrSize(first) || 0;
+
+  // ZXing版と同じ：min(画面幅*0.1, qrSize*0.45)
+  const distanceThreshold = Math.min(frameW * 0.1, qrSize * 0.45);
+
+  return d > distanceThreshold;
+}
+
   async function findSecondByDistance(first, W, H) {
     if (!first || !first.center) return null;
 
@@ -427,10 +464,12 @@
           const sx = Math.floor(tx - roiSize / 2);
           const sy = Math.floor(ty - roiSize / 2);
 
-          for (const sc of scales) {
-            const item = await decodeRegion(W, H, sx, sy, roiSize, roiSize, sc);
-            if (item && item.text && item.text !== first.text) return item;
-          }
+for (const sc of scales) {
+  const item = await decodeRegion(W, H, sx, sy, roiSize, roiSize, sc);
+
+  // ★ここが変更点：テキスト一致でも「距離」で別QRと確定できる
+  if (item && isDifferentSecondCandidate(first, item, W)) return item;
+}
         }
       }
     }
