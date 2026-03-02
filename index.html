@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>QRツイン リーダー（WASM/Worker版）</title>
+
+  <meta name="apple-mobile-web-app-title" content="QRツイン">
+  <meta name="application-name" content="QRツイン">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#121212">
+
+  <link rel="apple-touch-icon" sizes="180x180" href="icon.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="icon.png">
+  <link rel="manifest" href="manifest.json">
+
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0; padding: 0; background-color: #121212; color: #ffffff; text-align: center;
+    }
+    h2 { margin: 15px 0; font-size: 1.2rem; }
+    #startScreen, #resultScreen { padding: 20px; margin-top: 50px; }
+    #resultScreen { display: none; }
+    .camera-container {
+      position: relative; width: 100%; max-width: 600px; margin: 0 auto; background: #000; display: none;
+    }
+    video { width: 100%; display: block; object-fit: cover; }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+    .status-panel {
+      padding: 15px; background: #1e1e1e; border-top: 1px solid #333; text-align: left;
+      max-width: 600px; margin: 0 auto; display: none;
+    }
+    .qr-result { margin-bottom: 10px; padding: 10px; border-radius: 8px; background: #2c2c2c; word-break: break-all; }
+    .qr-1 { border-left: 5px solid #00E676; }
+    .qr-2 { border-left: 5px solid #29B6F6; }
+
+    button {
+      width: 100%; max-width: 300px; padding: 15px; font-size: 1.1rem; font-weight: bold;
+      background: #6200EE; color: white; border: none; border-radius: 8px; cursor: pointer; margin-top: 10px;
+    }
+    button:disabled { background: #555; cursor: not-allowed; color: #aaa; }
+    #startBtn { background: #81C784; color: #121212; }
+    #startBtn:active { background: #66BB6A; }
+    #backBtn { background: #03DAC6; color: #000; margin-top: 30px; }
+    #backBtn:active { background: #018786; }
+
+    .small { font-size:.8rem;color:#aaa;margin-bottom:10px; }
+  </style>
+</head>
+
+<body>
+  <h2>📱 QRツイン リーダー（WASM/Worker）</h2>
+
+  <div id="startScreen">
+    <p class="small">
+      単体QRとして1個目を確実に取得 → その距離関係で2個目を探索します。<br>
+      エンジン: zxing-wasm（ZXing-cpp WASM）+ Worker
+    </p>
+    <button id="startBtn" onclick="startApp()">📷 カメラを起動する</button>
+    <div class="small" id="bootMsg"></div>
+  </div>
+
+  <div class="camera-container" id="cameraContainer">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="overlayCanvas"></canvas>
+  </div>
+
+  <div class="status-panel" id="statusPanel">
+    <div class="small">
+      🐢 エンジン: WASM（単体強化 → 距離探索） / Workerで重い処理を分離
+    </div>
+    <div class="qr-result qr-1"><strong>1個目:</strong> <span id="text1">未検出</span></div>
+    <div class="qr-result qr-2"><strong>2個目:</strong> <span id="text2">未検出</span></div>
+    <div class="small" id="perfMsg"></div>
+  </div>
+
+  <div id="resultScreen">
+    <h3 style="color:#00E676;margin-bottom:20px;">✅ 読み取り完了！</h3>
+    <div class="qr-result qr-1" style="text-align:left;"><strong>1個目:</strong><br><span id="finalText1"></span></div>
+    <div class="qr-result qr-2" style="text-align:left;"><strong>2個目:</strong><br><span id="finalText2"></span></div>
+    <button id="backBtn" onclick="goBack()">🔙 もとのカメラ画面に戻る</button>
+  </div>
+
+<script>
+  // ==========
+  // UI / Canvas
+  // ==========
+  const video = document.getElementById('video');
+  const overlayCanvas = document.getElementById('overlayCanvas');
+  const ctx = overlayCanvas.getContext('2d');
+
+  const frameCanvas = document.createElement('canvas');
+  const frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+
+  const workCanvas = document.createElement('canvas');
+  const workCtx = workCanvas.getContext('2d', { willReadFrequently: true });
+
+  // ==========
+  // Worker (zxing-wasm)
+  // ==========
+  let worker = null;
+  let workerReady = false;
+  let reqId = 1;
+  const pending = new Map(); // id -> {resolve, reject}
+
+  function initWorker() {
+    if (worker) return;
+
+    worker = new Worker('./zxing_worker.js');
+
+    worker.onmessage = (ev) => {
+      const msg = ev.data || {};
+      if (msg.type === 'ready') {
+        workerReady = true;
+        document.getElementById('bootMsg').innerText = "✅ デコーダー準備OK";
+        return;
+      }
+      if (msg.type === 'resp') {
+        const p = pending.get(msg.id);
+        if (!p) return;
+        pending.delete(msg.id);
+        if (msg.ok) p.resolve(msg.payload);
+        else p.reject(new Error(msg.error || "decode failed"));
+        return;
+      }
+      if (msg.type === 'fatal') {
+        document.getElementById('bootMsg').innerText = "❌ Worker初期化失敗: " + (msg.error || "");
+      }
+    };
+
+    worker.onerror = (e) => {
+      document.getElementById('bootMsg').innerText = "❌ Workerエラー: " + e.message;
+    };
+  }
+
+  function decodeInWorker(imageData, options) {
+    // 1リクエスト=1レスポンスで扱いやすくする
+    return new Promise((resolve, reject) => {
+      if (!workerReady) return reject(new Error("worker not ready"));
+
+      const id = reqId++;
+      pending.set(id, { resolve, reject });
+
+      // Transferable でコピーを避ける
+      worker.postMessage({
+        type: 'req',
+        id,
+        width: imageData.width,
+        height: imageData.height,
+        data: imageData.data.buffer,
+        options: options || null,
+      }, [imageData.data.buffer]);
+    });
+  }
+
+  // ==========
+  // State
+  // ==========
+  let isProcessing = false;
+  let isScanning = false;
+  let lastDetectTime = 0;
+
+  // ★感度に直結：重い端末は150〜220へ
+  const SCAN_INTERVAL_MS = 120;
+
+  let firstQR = null;
+  let secondQR = null;
+
+  // ==========
+  // Camera
+  // ==========
+  async function startCamera() {
+    try {
+      if (video.srcObject) {
+        try { video.srcObject.getTracks().forEach(t => t.stop()); } catch (_) {}
+        video.srcObject = null;
+      }
+
+      const candidates = [
+        { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+        { video: { facingMode: { ideal: 'environment' } }, audio: false },
+        { video: true, audio: false },
+      ];
+
+      let stream = null;
+      let lastErr = null;
+      for (const c of candidates) {
+        try { stream = await navigator.mediaDevices.getUserMedia(c); break; }
+        catch (e) { lastErr = e; }
+      }
+      if (!stream) throw lastErr || new Error("getUserMedia failed");
+
+      video.srcObject = stream;
+
+      await new Promise((resolve) => {
+        const to = setTimeout(resolve, 1000);
+        video.onloadedmetadata = () => { clearTimeout(to); resolve(); };
+      });
+
+      await video.play();
+      return true;
+    } catch (err) {
+      console.error(err);
+      alert("カメラを起動できません。\n権限/HTTPS/他アプリ使用中を確認してください。\nエラー: " + (err?.message || err));
+      return false;
+    }
+  }
+
+  // ==========
+  // QR Twin logic (same structure as original)
+  // ==========
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  function getCenter(points) {
+    if (!points || points.length === 0) return { x: 0, y: 0 };
+    let sx = 0, sy = 0;
+    for (const p of points) { sx += p.x; sy += p.y; }
+    return { x: sx / points.length, y: sy / points.length };
+  }
+
+  function bboxFromPoints(points) {
+    if (!points || points.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of points) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    const pad = 14;
+    return {
+      x: Math.max(0, minX - pad),
+      y: Math.max(0, minY - pad),
+      w: (maxX - minX) + pad * 2,
+      h: (maxY - minY) + pad * 2
+    };
+  }
+
+  function mapWorkerResultToItem(best, sx = 0, sy = 0, scale = 1) {
+    // best.position は zxing-wasm の position 形式（topLeft等）を想定。
+    // position が無い端末/状況もあるのでガード。
+    let pts = [];
+    if (best && best.position) {
+      const pos = best.position;
+      // zxing-wasm の position は { topLeft, topRight, bottomRight, bottomLeft } 等になることが多い
+      const cand = [pos.topLeft, pos.topRight, pos.bottomRight, pos.bottomLeft].filter(Boolean);
+      pts = cand.map(p => ({
+        x: (p.x / scale) + sx,
+        y: (p.y / scale) + sy
+      }));
+    }
+
+    const center = getCenter(pts);
+    const bb = bboxFromPoints(pts);
+
+    let size = 0;
+    if (bb) size = Math.max(bb.w, bb.h);
+    size = Math.max(60, size);
+
+    return {
+      text: best?.text || "",
+      points: pts,
+      center,
+      bbox: bb,
+      size,
+      meta: best || null
+    };
+  }
+
+  async function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale = 1.0) {
+    sx = clamp(sx, 0, frameW - 2);
+    sy = clamp(sy, 0, frameH - 2);
+    sw = clamp(sw, 2, frameW - sx);
+    sh = clamp(sh, 2, frameH - sy);
+
+    const tw = Math.max(64, Math.floor(sw * scale));
+    const th = Math.max(64, Math.floor(sh * scale));
+
+    workCanvas.width = tw;
+    workCanvas.height = th;
+    workCtx.clearRect(0, 0, tw, th);
+    workCtx.drawImage(frameCanvas, sx, sy, sw, sh, 0, 0, tw, th);
+
+    const img = workCtx.getImageData(0, 0, tw, th);
+
+    // Worker decode options（QRコード専用）
+    const opts = { formats: ["QRCode"], tryHarder: true, tryRotate: true, tryInvert: true };
+
+    const t0 = performance.now();
+    const payload = await decodeInWorker(img, opts);
+    const t1 = performance.now();
+
+    // payload: { found:boolean, results:[...] , ms:number }
+    document.getElementById('perfMsg').innerText =
+      `decode(worker): ${payload.ms?.toFixed?.(1) ?? "?"}ms / total:${(t1 - t0).toFixed(1)}ms`;
+
+    if (!payload.found) return null;
+
+    const best = payload.results[0]; // 1つ目（最良）を採用
+    return mapWorkerResultToItem(best, sx, sy, scale);
+  }
+
+  // ★ここが「QRツインでも単体を的確に読む」ための改良核心（元ロジック維持）
+  // 1) フルフレーム複数スケール
+  // 2) ダメなら少数タイル探索（中心＋周辺）
+  async function findFirstRobust(W, H) {
+    const fullScales = [1.0, 0.86, 1.18];
+    for (const sc of fullScales) {
+      const got = await decodeRegion(W, H, 0, 0, W, H, sc);
+      if (got) return got;
+    }
+
+    const tileRatios = [0.72, 0.62];
+    const scales = [1.0, 1.18];
+
+    for (const tr of tileRatios) {
+      const tw = Math.floor(W * tr);
+      const th = Math.floor(H * tr);
+
+      const positions = [
+        { x: (W - tw) / 2, y: (H - th) / 2 }, // center
+        { x: 0, y: 0 },                       // TL
+        { x: W - tw, y: 0 },                  // TR
+        { x: 0, y: H - th },                  // BL
+        { x: W - tw, y: H - th },             // BR
+        { x: (W - tw) / 2, y: 0 },            // top
+        { x: (W - tw) / 2, y: H - th },       // bottom
+        { x: 0, y: (H - th) / 2 },            // left
+        { x: W - tw, y: (H - th) / 2 },       // right
+      ];
+
+      for (const pos of positions) {
+        for (const sc of scales) {
+          const got = await decodeRegion(W, H, Math.floor(pos.x), Math.floor(pos.y), tw, th, sc);
+          if (got) return got;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  // 距離探索（2個目）— 元ロジック維持（async化のみ）
+  async function findSecondByDistance(first, W, H) {
+    if (!first || !first.center) return null;
+
+    const cx = first.center.x;
+    const cy = first.center.y;
+
+    const base = first.size;
+    const radii = [1.0, 1.35, 1.75].map(k => base * k);
+
+    const N = 12;
+    const angles = [];
+    for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
+
+    const roiSize = clamp(base * 1.35, 140, 520);
+    const scales = [1.0, 1.18, 0.86];
+
+    for (const r of radii) {
+      for (const ang of angles) {
+        const tx = cx + Math.cos(ang) * r;
+        const ty = cy + Math.sin(ang) * r;
+
+        const sx = Math.floor(tx - roiSize / 2);
+        const sy = Math.floor(ty - roiSize / 2);
+        const sw = Math.floor(roiSize);
+        const sh = Math.floor(roiSize);
+
+        for (const sc of scales) {
+          const item = await decodeRegion(W, H, sx, sy, sw, sh, sc);
+          if (item && item.text && item.text !== first.text) return item;
+        }
+      }
+    }
+    return null;
+  }
+
+  // ==========
+  // Main scan loop
+  // ==========
+  async function processOneFrame() {
+    const W = overlayCanvas.width;
+    const H = overlayCanvas.height;
+
+    frameCanvas.width = W;
+    frameCanvas.height = H;
+    frameCtx.drawImage(video, 0, 0, W, H);
+
+    // 1) まず1個目（強化単体）
+    if (!firstQR) {
+      const got = await findFirstRobust(W, H);
+      if (got) {
+        firstQR = got;
+        updateUI();
+      }
+    } else {
+      // 1個目が見えている間は軽く更新
+      const got = await decodeRegion(W, H, 0, 0, W, H, 0.92);
+      if (got && got.text === firstQR.text) {
+        firstQR = got;
+        updateUI();
+      }
+    }
+
+    // 2) 1個目が取れたら2個目を距離探索
+    if (firstQR && !secondQR) {
+      const found = await findSecondByDistance(firstQR, W, H);
+      if (found) {
+        secondQR = found;
+        updateUI();
+      }
+    }
+
+    // 3) 描画（bbox）
+    ctx.clearRect(0, 0, W, H);
+    if (firstQR?.bbox) drawBBox(firstQR.bbox, '#00E676');
+    if (secondQR?.bbox) drawBBox(secondQR.bbox, '#29B6F6');
+
+    if (firstQR && secondQR) {
+      showResultScreen();
+      isScanning = false;
+    }
+  }
+
+  function scanLoop() {
+    if (!isScanning) return;
+
+    if (video.videoWidth && overlayCanvas.width !== video.videoWidth) {
+      overlayCanvas.width = video.videoWidth;
+      overlayCanvas.height = video.videoHeight;
+    }
+
+    const now = Date.now();
+    if (!isProcessing && now - lastDetectTime > SCAN_INTERVAL_MS && video.readyState >= 2 && workerReady) {
+      isProcessing = true;
+      lastDetectTime = now;
+
+      processOneFrame()
+        .catch(() => { /* ignore */ })
+        .finally(() => { isProcessing = false; });
+    }
+
+    requestAnimationFrame(scanLoop);
+  }
+
+  function drawBBox(bb, color) {
+    if (!bb) return;
+    ctx.save();
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color + "22";
+    ctx.strokeRect(bb.x, bb.y, bb.w, bb.h);
+    ctx.fillRect(bb.x, bb.y, bb.w, bb.h);
+    ctx.restore();
+  }
+
+  function updateUI() {
+    if (firstQR) document.getElementById('text1').innerText = firstQR.text;
+    if (secondQR) document.getElementById('text2').innerText = secondQR.text;
+  }
+
+  function formatResultText(text) {
+    if (/^https?:\/\//i.test(text)) {
+      return `<a href="${text}" target="_blank" rel="noopener noreferrer" style="color:#03DAC6;text-decoration:underline;font-weight:bold;">${text}</a>`;
+    }
+    const div = document.createElement('div');
+    div.innerText = text;
+    return div.innerHTML;
+  }
+
+  function showResultScreen() {
+    if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
+    document.getElementById('cameraContainer').style.display = 'none';
+    document.getElementById('statusPanel').style.display = 'none';
+    document.getElementById('resultScreen').style.display = 'block';
+    document.getElementById('finalText1').innerHTML = formatResultText(firstQR.text);
+    document.getElementById('finalText2').innerHTML = formatResultText(secondQR.text);
+  }
+
+  function goBack() {
+    firstQR = null;
+    secondQR = null;
+    document.getElementById('text1').innerText = "未検出";
+    document.getElementById('text2').innerText = "未検出";
+    document.getElementById('resultScreen').style.display = 'none';
+    document.getElementById('cameraContainer').style.display = 'block';
+    document.getElementById('statusPanel').style.display = 'block';
+    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    isScanning = true;
+    requestAnimationFrame(scanLoop);
+  }
+
+  // ==========
+  // Start
+  // ==========
+  async function startApp() {
+    const startBtn = document.getElementById('startBtn');
+    startBtn.disabled = true;
+    startBtn.innerText = "準備中...";
+
+    try {
+      initWorker();
+
+      // Worker ready を軽く待つ（最大 3秒）
+      const t0 = Date.now();
+      while (!workerReady) {
+        if (Date.now() - t0 > 3000) throw new Error("デコーダー初期化がタイムアウトしました（index.js / wasmの配置を確認）");
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      const ok = await startCamera();
+      if (!ok) throw new Error("カメラ起動失敗");
+
+      document.getElementById('startScreen').style.display = 'none';
+      document.getElementById('cameraContainer').style.display = 'block';
+      document.getElementById('statusPanel').style.display = 'block';
+
+      isScanning = true;
+      requestAnimationFrame(scanLoop);
+    } catch (e) {
+      console.error(e);
+      alert("起動に失敗: " + (e?.message || e));
+      startBtn.disabled = false;
+      startBtn.innerText = "📷 カメラを起動する";
+    }
+  }
+
+  // グローバルに公開（onclickから呼ぶ）
+  window.startApp = startApp;
+  window.goBack = goBack;
+</script>
+</body>
+</html>
