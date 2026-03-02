@@ -301,21 +301,55 @@ function mapWorkerResultToItem(best, sx = 0, sy = 0, sw = 0, sh = 0, scale = 1) 
   };
 }
 
-  async function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale = 1.0) {
-    sx = clamp(sx, 0, frameW - 2);
-    sy = clamp(sy, 0, frameH - 2);
-    sw = clamp(sw, 2, frameW - sx);
-    sh = clamp(sh, 2, frameH - sy);
+async function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale = 1.0) {
+  sx = clamp(sx, 0, frameW - 2);
+  sy = clamp(sy, 0, frameH - 2);
+  sw = clamp(sw, 2, frameW - sx);
+  sh = clamp(sh, 2, frameH - sy);
 
-    const tw = Math.max(64, Math.floor(sw * scale));
-    const th = Math.max(64, Math.floor(sh * scale));
+  const tw = Math.max(64, Math.floor(sw * scale));
+  const th = Math.max(64, Math.floor(sh * scale));
 
-    workCanvas.width = tw;
-    workCanvas.height = th;
-    workCtx.clearRect(0, 0, tw, th);
-    workCtx.drawImage(frameCanvas, sx, sy, sw, sh, 0, 0, tw, th);
+  workCanvas.width = tw;
+  workCanvas.height = th;
+  workCtx.clearRect(0, 0, tw, th);
+  workCtx.drawImage(frameCanvas, sx, sy, sw, sh, 0, 0, tw, th);
 
-    const img = workCtx.getImageData(0, 0, tw, th);
+  const img = workCtx.getImageData(0, 0, tw, th);
+
+  // Worker decode options（段階化）
+  const opts = getDecodeOpts(decodeLevel);
+
+  const t0 = performance.now();
+
+  let payload;
+  try {
+    payload = await decodeInWorker(img, opts);
+  } catch (e) {
+    document.getElementById('perfMsg').innerText =
+      `decode(worker) ERROR: ${e?.message || e}`;
+    return null;
+  }
+
+  const t1 = performance.now();
+
+  // EMA更新（worker内部ms / total）
+  const wms = Number(payload.ms || 0);
+  const tms = (t1 - t0);
+
+  emaDecodeMs = emaDecodeMs ? (emaDecodeMs * (1 - EMA_ALPHA) + wms * EMA_ALPHA) : wms;
+  emaTotalMs  = emaTotalMs  ? (emaTotalMs  * (1 - EMA_ALPHA) + tms * EMA_ALPHA) : tms;
+
+  updateScanInterval();
+
+  document.getElementById('perfMsg').innerText =
+    `decodeL=${decodeLevel} scan=${scanIntervalMs}ms | worker=${wms.toFixed(1)}ms ema=${emaDecodeMs.toFixed(1)} | total=${tms.toFixed(1)}ms ema=${emaTotalMs.toFixed(1)}`;
+
+  if (!payload.found) return null;
+
+  const best = payload.results[0];
+  return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
+}
 
 function getDecodeOpts(level) {
   // level 0: 最速（回転/反転/tryHarderなし）
@@ -604,8 +638,8 @@ if (!isProcessing && now - lastDetectTime > scanIntervalMs && video.readyState >
     document.getElementById('finalText2').innerHTML = formatResultText(secondQR.text);
   }
 
-  function goBack() {
- firstQR = null;
+function goBack() {
+  firstQR = null;
   secondQR = null;
 
   // ★段階化状態をリセット
@@ -616,17 +650,16 @@ if (!isProcessing && now - lastDetectTime > scanIntervalMs && video.readyState >
   emaDecodeMs = 0;
   emaTotalMs = 0;
   scanIntervalMs = 120;
-    firstQR = null;
-    secondQR = null;
-    document.getElementById('text1').innerText = "未検出";
-    document.getElementById('text2').innerText = "未検出";
-    document.getElementById('resultScreen').style.display = 'none';
-    document.getElementById('cameraContainer').style.display = 'block';
-    document.getElementById('statusPanel').style.display = 'block';
-    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-    isScanning = true;
-    requestAnimationFrame(scanLoop);
-  }
+
+  document.getElementById('text1').innerText = "未検出";
+  document.getElementById('text2').innerText = "未検出";
+  document.getElementById('resultScreen').style.display = 'none';
+  document.getElementById('cameraContainer').style.display = 'block';
+  document.getElementById('statusPanel').style.display = 'block';
+  ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+  isScanning = true;
+  requestAnimationFrame(scanLoop);
+}
 
   // ==========
   // Start
