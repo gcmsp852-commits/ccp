@@ -380,6 +380,55 @@
     return null;
   }
 
+// ★追加：領域をマスク（= firstのbboxを避けて2回目を探す）
+async function decodeFullFrameExcludingFirst(first, W, H) {
+  if (!first?.bbox) return null;
+
+  // first bbox を少し広げて“除外”
+  const pad = 20;
+  const ex = {
+    x: Math.max(0, first.bbox.x - pad),
+    y: Math.max(0, first.bbox.y - pad),
+    w: Math.min(W, first.bbox.w + pad * 2),
+    h: Math.min(H, first.bbox.h + pad * 2),
+  };
+
+  // 画面をタイル分割して「除外領域と被らないタイル」だけ decode
+  const tileRatios = [0.72, 0.62];
+  const scales = [1.0, 1.18];
+
+  for (const tr of tileRatios) {
+    const tw = Math.floor(W * tr);
+    const th = Math.floor(H * tr);
+
+    const positions = [
+      { x: (W - tw) / 2, y: (H - th) / 2 },
+      { x: 0, y: 0 }, { x: W - tw, y: 0 }, { x: 0, y: H - th }, { x: W - tw, y: H - th },
+      { x: (W - tw) / 2, y: 0 }, { x: (W - tw) / 2, y: H - th },
+      { x: 0, y: (H - th) / 2 }, { x: W - tw, y: (H - th) / 2 },
+    ];
+
+    for (const pos of positions) {
+      const sx = Math.floor(pos.x), sy = Math.floor(pos.y);
+
+      // 除外bboxと大きく重なるタイルはスキップ
+      const overlapX = Math.max(0, Math.min(sx + tw, ex.x + ex.w) - Math.max(sx, ex.x));
+      const overlapY = Math.max(0, Math.min(sy + th, ex.y + ex.h) - Math.max(sy, ex.y));
+      const overlapArea = overlapX * overlapY;
+      const tileArea = tw * th;
+      if (tileArea > 0 && overlapArea / tileArea > 0.35) continue; // 35%以上被ればスキップ
+
+      for (const sc of scales) {
+        const got = await decodeRegion(W, H, sx, sy, tw, th, sc);
+        if (got && isDifferentSecondCandidate(first, got, W)) return got;
+      }
+    }
+  }
+
+  return null;
+}
+
+
 // ★追加：距離とサイズ
 function dist2(a, b) {
   const dx = a.x - b.x, dy = a.y - b.y;
@@ -501,29 +550,49 @@ for (const sc of scales) {
         else if (firstFailStreak < 8) decodeLevel = 1;
         else decodeLevel = 2;
       }
-    } else {
-      const got = await decodeRegion(W, H, 0, 0, W, H, 0.92);
-      if (got && got.text === firstQR.text) {
-        firstQR = got;
-        updateUI();
-      }
-    }
+// 修正後（差し替え）
+} else {
+  const got = await decodeRegion(W, H, 0, 0, W, H, 0.92);
 
-    if (firstQR && !secondQR) {
-      if (secondFailStreak < 3) secondSearchLevel = 0;
-      else if (secondFailStreak < 8) secondSearchLevel = 1;
-      else secondSearchLevel = 2;
-
-      const found = await findSecondByDistance(firstQR, W, H);
-      if (found) {
-        secondQR = found;
-        secondFailStreak = 0;
-        secondSearchLevel = 0;
-        updateUI();
-      } else {
-        secondFailStreak++;
-      }
+  if (got) {
+    // ★同一フレームで“もう一方”が取れたら固定せず second に回す
+    if (!secondQR && isDifferentSecondCandidate(firstQR, got, W)) {
+      secondQR = got;
+      secondFailStreak = 0;
+      secondSearchLevel = 0;
+      updateUI();
     }
+    // ★同じものなら従来通り first を追跡更新
+    else if (got.text === firstQR.text) {
+      firstQR = got;
+      updateUI();
+    }
+  }
+}
+
+// 修正後（差し替え）
+if (firstQR && !secondQR) {
+  if (secondFailStreak < 3) secondSearchLevel = 0;
+  else if (secondFailStreak < 8) secondSearchLevel = 1;
+  else secondSearchLevel = 2;
+
+  // ★(A) まず「first領域を避けて全体から2個目」を拾う（=固定されすぎ対策の本丸）
+  let found = await decodeFullFrameExcludingFirst(firstQR, W, H);
+
+  // ★(B) ダメなら従来の距離探索（関係性が見えないケース用）
+  if (!found) {
+    found = await findSecondByDistance(firstQR, W, H);
+  }
+
+  if (found) {
+    secondQR = found;
+    secondFailStreak = 0;
+    secondSearchLevel = 0;
+    updateUI();
+  } else {
+    secondFailStreak++;
+  }
+}
 
     ctx.clearRect(0, 0, W, H);
     if (firstQR?.bbox) drawBBox(firstQR.bbox, '#00E676');
