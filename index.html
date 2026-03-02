@@ -163,8 +163,36 @@
   let isScanning = false;
   let lastDetectTime = 0;
 
-  // ★感度に直結：重い端末は150〜220へ
-  const SCAN_INTERVAL_MS = 120;
+// ★自動調整SCAN間隔（遅い端末ほど間隔を伸ばす）
+let scanIntervalMs = 120;
+
+// decode時間の指数移動平均（EMA）
+let emaDecodeMs = 0;      // payload.ms（worker内部）
+let emaTotalMs  = 0;      // total（getImageData + postMessage + decode など全部込み）
+const EMA_ALPHA = 0.2;
+
+// 段階化用の失敗連続カウンタ
+let firstFailStreak = 0;   // 1個目が取れない連続回数
+let secondFailStreak = 0;  // 2個目が取れない連続回数
+
+// decodeオプションの段階（0=軽い, 1=中, 2=重い）
+let decodeLevel = 0;
+
+// 2個目探索の段階（0=速い/狭い, 1=標準, 2=救済）
+let secondSearchLevel = 0;
+
+function clampInt(v, a, b) { return Math.max(a, Math.min(b, v | 0)); }
+
+// ★重いときだけスキャン間隔を伸ばす（目標：処理が詰まらない）
+function updateScanInterval() {
+  // totalが大きいほど次フレームを間引く
+  const base = emaTotalMs || 0;
+  // だいたい「処理時間の1.2倍 + 10ms」を目安にする
+  const target = Math.round(base * 1.2 + 10);
+
+  // 軽い時は下げすぎない、重い時は上げる
+  scanIntervalMs = clampInt(target, 90, 320);
+}
 
   let firstQR = null;
   let secondQR = null;
@@ -289,10 +317,30 @@ function mapWorkerResultToItem(best, sx = 0, sy = 0, sw = 0, sh = 0, scale = 1) 
 
     const img = workCtx.getImageData(0, 0, tw, th);
 
-// Worker decode options（QRコード専用）
-const opts = { formats: ["QRCode"], tryHarder: true, tryRotate: true, tryInvert: true };
+function getDecodeOpts(level) {
+  // level 0: 最速（回転/反転/tryHarderなし）
+  // level 1: 中（回転だけ許可）
+  // level 2: 重（tryHarder + 回転 + 反転）
+  if (level === 0) return { formats: ["QRCode"], tryHarder: false, tryRotate: false, tryInvert: false };
+  if (level === 1) return { formats: ["QRCode"], tryHarder: false, tryRotate: true,  tryInvert: false };
+  return               { formats: ["QRCode"], tryHarder: true,  tryRotate: true,  tryInvert: true  };
+}
+
+// Worker decode options（段階化）
+const opts = getDecodeOpts(decodeLevel);
 
 const t0 = performance.now();
+
+let payload;
+try {
+  payload = await decodeInWorker(img, opts);
+} catch (e) {
+  document.getElementById('perfMsg').innerText =
+    `decode(worker) ERROR: ${e?.message || e}`;
+  return null;
+}
+
+const t1 = performance.now();
 
 let payload;
 try {
@@ -307,8 +355,17 @@ try {
 const t1 = performance.now();
 
 // payload: { found:boolean, results:[.] , ms:number }
+// EMA更新（worker内部ms / total）
+const wms = Number(payload.ms || 0);
+const tms = (t1 - t0);
+
+emaDecodeMs = emaDecodeMs ? (emaDecodeMs * (1 - EMA_ALPHA) + wms * EMA_ALPHA) : wms;
+emaTotalMs  = emaTotalMs  ? (emaTotalMs  * (1 - EMA_ALPHA) + tms * EMA_ALPHA) : tms;
+
+updateScanInterval();
+
 document.getElementById('perfMsg').innerText =
-  `decode(worker): ${payload.ms?.toFixed?.(1) ?? "?"}ms / total:${(t1 - t0).toFixed(1)}ms`;
+  `decodeL=${decodeLevel} scan=${scanIntervalMs}ms | worker=${wms.toFixed(1)}ms ema=${emaDecodeMs.toFixed(1)} | total=${tms.toFixed(1)}ms ema=${emaTotalMs.toFixed(1)}`;
 
 if (!payload.found) return null;
 
@@ -356,61 +413,56 @@ return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
     return null;
   }
 
-  // 距離探索（2個目）— 元ロジック維持（async化のみ）
-async function findSecondByDistance(first, W, H) {
+ async function findSecondByDistance(first, W, H) {
   if (!first || !first.center) return null;
 
   const cx = first.center.x;
   const cy = first.center.y;
 
-  // ★干渉でsizeが小さく出ることがあるので下限を上げる
+  // ★sizeが小さく出ると探索半径が届かないので下限を上げる
   const base = Math.max(first.size || 0, 180);
 
-  // ========== 第1段：軽め（今の延長） ==========
-  {
-    const radii = [0.9, 1.2, 1.55, 1.9].map(k => base * k);
+  // secondSearchLevel:
+  // 0=速い（試行少なめ）
+  // 1=標準（少し広め）
+  // 2=救済（かなり広め・重め）
+  const level = secondSearchLevel;
 
-    const N = 16; // 12→16（少しだけ増やす）
-    const angles = [];
-    for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
+  let radiiKs, N, roiSizes, scales;
 
-    const roiSizes = [
-      clamp(base * 1.35, 160, 560),
+  if (level === 0) {
+    // 最速：まずは “近め” を少ない試行で探す
+    radiiKs = [1.0, 1.5];
+    N = 8;
+    roiSizes = [clamp(base * 1.35, 160, 560)];
+    scales = [1.0, 1.18]; // 0.86はまず外す（遅くなる）
+  } else if (level === 1) {
+    // 標準：範囲を広げる
+    radiiKs = [0.9, 1.2, 1.55, 1.9];
+    N = 14;
+    roiSizes = [
+      clamp(base * 1.35, 160, 600),
       clamp(base * 1.70, 220, 720),
     ];
-
-    const scales = [1.18, 1.0, 0.86]; // 少し拡大優先
-
-    for (const roiSize of roiSizes) {
-      for (const r of radii) {
-        for (const ang of angles) {
-          const tx = cx + Math.cos(ang) * r;
-          const ty = cy + Math.sin(ang) * r;
-
-          const sx = Math.floor(tx - roiSize / 2);
-          const sy = Math.floor(ty - roiSize / 2);
-
-          for (const sc of scales) {
-            const item = await decodeRegion(W, H, sx, sy, roiSize, roiSize, sc);
-            if (item && item.text && item.text !== first.text) return item;
-          }
-        }
-      }
-    }
+    scales = [1.18, 1.0, 0.86];
+  } else {
+    // 救済：遠い/ズレる/歪むケース用
+    radiiKs = [1.0, 1.5, 2.1, 2.7, 3.2];
+    N = 18;
+    roiSizes = [
+      clamp(base * 1.70, 220, 760),
+      clamp(base * 2.20, 320, 940),
+    ];
+    scales = [1.18, 1.0, 0.86];
   }
 
-  // ========== 第2段：救済（見つからない時だけ重め） ==========
-  {
-    // 「中心ズレ」や「2個目が想定より遠い」ケースの救済
-    const radii = [2.2, 2.6, 3.0].map(k => base * k);
-    const N = 20; // 救済時だけ増やす
-    const angles = [];
-    for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
+  const angles = [];
+  for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
 
-    const roiSize = clamp(base * 2.2, 320, 900);
-    const scales = [1.18, 1.0];
+  for (const roiSize of roiSizes) {
+    for (const k of radiiKs) {
+      const r = base * k;
 
-    for (const r of radii) {
       for (const ang of angles) {
         const tx = cx + Math.cos(ang) * r;
         const ty = cy + Math.sin(ang) * r;
@@ -441,29 +493,50 @@ async function findSecondByDistance(first, W, H) {
     frameCtx.drawImage(video, 0, 0, W, H);
 
     // 1) まず1個目（強化単体）
-    if (!firstQR) {
-      const got = await findFirstRobust(W, H);
-      if (got) {
-        firstQR = got;
-        updateUI();
-      }
-    } else {
-      // 1個目が見えている間は軽く更新
-      const got = await decodeRegion(W, H, 0, 0, W, H, 0.92);
-      if (got && got.text === firstQR.text) {
-        firstQR = got;
-        updateUI();
-      }
-    }
+if (!firstQR) {
+  const got = await findFirstRobust(W, H);
+
+  if (got) {
+    firstQR = got;
+    firstFailStreak = 0;
+    decodeLevel = 0;         // 取れたら最速に戻す
+    updateUI();
+  } else {
+    firstFailStreak++;
+
+    // ★段階化：外し続けたら decode を重くする
+    // 0: 最速 → 1: 回転ON → 2: ぜんぶON
+    if (firstFailStreak < 3) decodeLevel = 0;
+    else if (firstFailStreak < 8) decodeLevel = 1;
+    else decodeLevel = 2;
+  }
+} else {
+  // 1個目が見えている間は軽く更新（ここは軽い設定を維持）
+  const got = await decodeRegion(W, H, 0, 0, W, H, 0.92);
+  if (got && got.text === firstQR.text) {
+    firstQR = got;
+    updateUI();
+  }
+}
 
     // 2) 1個目が取れたら2個目を距離探索
-    if (firstQR && !secondQR) {
-      const found = await findSecondByDistance(firstQR, W, H);
-      if (found) {
-        secondQR = found;
-        updateUI();
-      }
-    }
+// 2) 1個目が取れたら2個目を距離探索（段階化）
+if (firstQR && !secondQR) {
+  // ★2個目が取れない連続回数で探索段階を上げる（緩める）
+  if (secondFailStreak < 3) secondSearchLevel = 0;
+  else if (secondFailStreak < 8) secondSearchLevel = 1;
+  else secondSearchLevel = 2;
+
+  const found = await findSecondByDistance(firstQR, W, H);
+  if (found) {
+    secondQR = found;
+    secondFailStreak = 0;
+    secondSearchLevel = 0;
+    updateUI();
+  } else {
+    secondFailStreak++;
+  }
+}
 
     // 3) 描画（bbox）
     ctx.clearRect(0, 0, W, H);
@@ -485,7 +558,7 @@ async function findSecondByDistance(first, W, H) {
     }
 
     const now = Date.now();
-    if (!isProcessing && now - lastDetectTime > SCAN_INTERVAL_MS && video.readyState >= 2 && workerReady) {
+if (!isProcessing && now - lastDetectTime > scanIntervalMs && video.readyState >= 2 && workerReady) {
       isProcessing = true;
       lastDetectTime = now;
 
@@ -532,6 +605,17 @@ async function findSecondByDistance(first, W, H) {
   }
 
   function goBack() {
+ firstQR = null;
+  secondQR = null;
+
+  // ★段階化状態をリセット
+  firstFailStreak = 0;
+  secondFailStreak = 0;
+  decodeLevel = 0;
+  secondSearchLevel = 0;
+  emaDecodeMs = 0;
+  emaTotalMs = 0;
+  scanIntervalMs = 120;
     firstQR = null;
     secondQR = null;
     document.getElementById('text1').innerText = "未検出";
