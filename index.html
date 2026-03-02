@@ -289,15 +289,25 @@
     // Worker decode options（QRコード専用）
     const opts = { formats: ["QRCode"], tryHarder: true, tryRotate: true, tryInvert: true };
 
-    const t0 = performance.now();
-    const payload = await decodeInWorker(img, opts);
-    const t1 = performance.now();
+const t0 = performance.now();
 
-    // payload: { found:boolean, results:[...] , ms:number }
-    document.getElementById('perfMsg').innerText =
-      `decode(worker): ${payload.ms?.toFixed?.(1) ?? "?"}ms / total:${(t1 - t0).toFixed(1)}ms`;
+let payload;
+try {
+  payload = await decodeInWorker(img, opts);
+} catch (e) {
+  // ★ ここが追加ポイント：Workerエラーを画面表示
+  document.getElementById('perfMsg').innerText =
+    `decode(worker) ERROR: ${e?.message || e}`;
+  return null;
+}
 
-    if (!payload.found) return null;
+const t1 = performance.now();
+
+// payload: { found:boolean, results:[...] , ms:number }
+document.getElementById('perfMsg').innerText =
+  `decode(worker): ${payload.ms?.toFixed?.(1) ?? "?"}ms / total:${(t1 - t0).toFixed(1)}ms`;
+
+if (!payload.found) return null;
 
     const best = payload.results[0]; // 1つ目（最良）を採用
     return mapWorkerResultToItem(best, sx, sy, scale);
