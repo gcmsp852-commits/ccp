@@ -239,36 +239,39 @@
     };
   }
 
-  function mapWorkerResultToItem(best, sx = 0, sy = 0, scale = 1) {
-    // best.position は zxing-wasm の position 形式（topLeft等）を想定。
-    // position が無い端末/状況もあるのでガード。
-    let pts = [];
-    if (best && best.position) {
-      const pos = best.position;
-      // zxing-wasm の position は { topLeft, topRight, bottomRight, bottomLeft } 等になることが多い
-      const cand = [pos.topLeft, pos.topRight, pos.bottomRight, pos.bottomLeft].filter(Boolean);
-      pts = cand.map(p => ({
-        x: (p.x / scale) + sx,
-        y: (p.y / scale) + sy
-      }));
-    }
-
-    const center = getCenter(pts);
-    const bb = bboxFromPoints(pts);
-
-    let size = 0;
-    if (bb) size = Math.max(bb.w, bb.h);
-    size = Math.max(60, size);
-
-    return {
-      text: best?.text || "",
-      points: pts,
-      center,
-      bbox: bb,
-      size,
-      meta: best || null
-    };
+function mapWorkerResultToItem(best, sx = 0, sy = 0, sw = 0, sh = 0, scale = 1) {
+  let pts = [];
+  if (best && best.position) {
+    const pos = best.position;
+    const cand = [pos.topLeft, pos.topRight, pos.bottomRight, pos.bottomLeft].filter(Boolean);
+    pts = cand.map(p => ({
+      x: (p.x / scale) + sx,
+      y: (p.y / scale) + sy
+    }));
   }
+
+  // ★フォールバック：positionが無い時は「ROI中心」を起点にする
+  let center = getCenter(pts);
+  let bb = bboxFromPoints(pts);
+
+  if (!bb) {
+    // ROIを仮bboxとして扱う（描画＆探索起点が壊れない）
+    bb = { x: sx, y: sy, w: sw, h: sh };
+    center = { x: sx + sw / 2, y: sy + sh / 2 };
+  }
+
+  let size = Math.max(bb.w, bb.h);
+  size = Math.max(120, size); // ★2個目探索に効くので下限を少し上げる
+
+  return {
+    text: best?.text || "",
+    points: pts,
+    center,
+    bbox: bb,
+    size,
+    meta: best || null
+  };
+}
 
   async function decodeRegion(frameW, frameH, sx, sy, sw, sh, scale = 1.0) {
     sx = clamp(sx, 0, frameW - 2);
@@ -310,7 +313,7 @@ document.getElementById('perfMsg').innerText =
 if (!payload.found) return null;
 
 const best = payload.results[0];
-return mapWorkerResultToItem(best, sx, sy, scale);
+return mapWorkerResultToItem(best, sx, sy, sw, sh, scale);
   }
 
   // ★ここが「QRツインでも単体を的確に読む」ための改良核心（元ロジック維持）
@@ -354,21 +357,58 @@ return mapWorkerResultToItem(best, sx, sy, scale);
   }
 
   // 距離探索（2個目）— 元ロジック維持（async化のみ）
-  async function findSecondByDistance(first, W, H) {
-    if (!first || !first.center) return null;
+async function findSecondByDistance(first, W, H) {
+  if (!first || !first.center) return null;
 
-    const cx = first.center.x;
-    const cy = first.center.y;
+  const cx = first.center.x;
+  const cy = first.center.y;
 
-    const base = first.size;
-    const radii = [1.0, 1.35, 1.75].map(k => base * k);
+  // ★干渉でsizeが小さく出ることがあるので下限を上げる
+  const base = Math.max(first.size || 0, 180);
 
-    const N = 12;
+  // ========== 第1段：軽め（今の延長） ==========
+  {
+    const radii = [0.9, 1.2, 1.55, 1.9].map(k => base * k);
+
+    const N = 16; // 12→16（少しだけ増やす）
     const angles = [];
     for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
 
-    const roiSize = clamp(base * 1.35, 140, 520);
-    const scales = [1.0, 1.18, 0.86];
+    const roiSizes = [
+      clamp(base * 1.35, 160, 560),
+      clamp(base * 1.70, 220, 720),
+    ];
+
+    const scales = [1.18, 1.0, 0.86]; // 少し拡大優先
+
+    for (const roiSize of roiSizes) {
+      for (const r of radii) {
+        for (const ang of angles) {
+          const tx = cx + Math.cos(ang) * r;
+          const ty = cy + Math.sin(ang) * r;
+
+          const sx = Math.floor(tx - roiSize / 2);
+          const sy = Math.floor(ty - roiSize / 2);
+
+          for (const sc of scales) {
+            const item = await decodeRegion(W, H, sx, sy, roiSize, roiSize, sc);
+            if (item && item.text && item.text !== first.text) return item;
+          }
+        }
+      }
+    }
+  }
+
+  // ========== 第2段：救済（見つからない時だけ重め） ==========
+  {
+    // 「中心ズレ」や「2個目が想定より遠い」ケースの救済
+    const radii = [2.2, 2.6, 3.0].map(k => base * k);
+    const N = 20; // 救済時だけ増やす
+    const angles = [];
+    for (let i = 0; i < N; i++) angles.push((Math.PI * 2 * i) / N);
+
+    const roiSize = clamp(base * 2.2, 320, 900);
+    const scales = [1.18, 1.0];
 
     for (const r of radii) {
       for (const ang of angles) {
@@ -377,17 +417,17 @@ return mapWorkerResultToItem(best, sx, sy, scale);
 
         const sx = Math.floor(tx - roiSize / 2);
         const sy = Math.floor(ty - roiSize / 2);
-        const sw = Math.floor(roiSize);
-        const sh = Math.floor(roiSize);
 
         for (const sc of scales) {
-          const item = await decodeRegion(W, H, sx, sy, sw, sh, sc);
+          const item = await decodeRegion(W, H, sx, sy, roiSize, roiSize, sc);
           if (item && item.text && item.text !== first.text) return item;
         }
       }
     }
-    return null;
   }
+
+  return null;
+}
 
   // ==========
   // Main scan loop
